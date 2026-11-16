@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Bloomwater RSI Fishing</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #0a1a2f; font-family: system-ui, sans-serif; }
+  canvas { display: block; }
+  #ui {
+    position: absolute; top: 20px; left: 20px; color: #e0f7ff; pointer-events: none;
+    text-shadow: 0 0 8px #00e5ff;
+  }
+  #ui h1 { margin: 0 0 8px 0; font-size: 28px; letter-spacing: 2px; }
+  #ui p { margin: 4px 0; font-size: 14px; opacity: 0.85; }
+  #rsi {
+    position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%);
+    width: 320px; height: 60px; background: rgba(0,0,0,0.4); border-radius: 8px;
+    border: 1px solid #00e5ff; padding: 8px; color: #fff; text-align: center;
+  }
+  #rsi .bar { height: 12px; background: #113; border-radius: 6px; margin-top: 6px; overflow: hidden; }
+  #rsi .fill { height: 100%; width: 50%; background: linear-gradient(90deg, #00e5ff, #ff00aa); transition: width 0.1s; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <h1>BLOOMWATER</h1>
+  <p>Click water to cast • Hold Space to reel • RSI = Resonance Strength Index</p>
+  <p id="status">Awaiting cast…</p>
+  <p id="score">Caught: 0</p>
+</div>
+<div id="rsi">
+  <div>RESONANCE STRENGTH INDEX</div>
+  <div class="bar"><div class="fill" id="fill"></div></div>
+  <div id="rsiVal">50.0</div>
+</div>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W, H;
+function resize() { W = canvas.width = innerWidth; H = canvas.height = innerHeight; }
+resize(); addEventListener('resize', resize);
+
+const particles = [];
+const fish = [];
+let bobber = null;
+let line = null;
+let reeling = false;
+let score = 0;
+let rsiHistory = [];
+let currentRSI = 50;
+
+class Particle {
+  constructor(x, y, vx, vy, life, size, color) {
+    this.x = x; this.y = y; this.vx = vx; this.vy = vy;
+    this.life = life; this.maxLife = life; this.size = size; this.color = color;
+  }
+  update() {
+    this.x += this.vx; this.y += this.vy;
+    this.vy += 0.12; this.vx *= 0.99;
+    this.life--;
+  }
+  draw() {
+    const a = this.life / this.maxLife;
+    ctx.globalAlpha = a * 0.8;
+    ctx.fillStyle = this.color;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.size * a, 0, Math.PI*2);
+    ctx.fill();
+    // bloom glow
+    ctx.shadowBlur = 20 * a;
+    ctx.shadowColor = this.color;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = 1;
+  }
+}
+
+function bloom(x, y, count = 40, power = 1) {
+  for (let i = 0; i < count; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const s = (2 + Math.random() * 6) * power;
+    particles.push(new Particle(
+      x, y,
+      Math.cos(a) * s, Math.sin(a) * s - 2,
+      40 + Math.random()*30,
+      3 + Math.random()*5,
+      `hsl(${180 + Math.random()*80}, 100%, ${60 + Math.random()*30}%)`
+    ));
+  }
+}
+
+class Fish {
+  constructor() {
+    this.x = Math.random() * W;
+    this.y = H * 0.55 + Math.random() * H * 0.35;
+    this.vx = (Math.random()-0.5) * 1.5;
+    this.size = 12 + Math.random()*20;
+    this.hue = 180 + Math.random()*120;
+    this.phase = Math.random()*Math.PI*2;
+  }
+  update() {
+    this.x += this.vx;
+    this.y += Math.sin(this.phase + Date.now()/400) * 0.4;
+    this.phase += 0.05;
+    if (this.x < -50 || this.x > W+50) this.vx *= -1;
+    // occasional bite chance if bobber near
+    if (bobber && !bobber.hooked && Math.hypot(this.x-bobber.x, this.y-bobber.y) < 40 && Math.random() < 0.008) {
+      bobber.hooked = this;
+      document.getElementById('status').textContent = 'BITE! Hold Space to reel';
+      bloom(bobber.x, bobber.y, 60, 1.5);
+    }
+  }
+  draw() {
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.scale(this.vx > 0 ? 1 : -1, 1);
+    ctx.fillStyle = `hsl(${this.hue}, 80%, 55%)`;
+    ctx.shadowBlur = 15;
+    ctx.shadowColor = `hsl(${this.hue}, 100%, 70%)`;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, this.size, this.size*0.45, 0, 0, Math.PI*2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(-this.size*0.8, 0);
+    ctx.lineTo(-this.size*1.4, -this.size*0.4);
+    ctx.lineTo(-this.size*1.4, this.size*0.4);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function calcRSI(values, period = 14) {
+  if (values.length < period + 1) return 50;
+  let gains = 0, losses = 0;
+  for (let i = values.length - period; i < values.length; i++) {
+    const diff = values[i] - values[i-1];
+    if (diff > 0) gains += diff; else losses -= diff;
+  }
+  const avgGain = gains / period;
+  const avgLoss = losses / period;
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - (100 / (1 + rs));
+}
+
+function cast(x, y) {
+  if (line) return;
+  const startY = H * 0.35;
+  line = { x1: W/2, y1: startY, x2: x, y2: y, progress: 0 };
+  bobber = { x, y, hooked: null, tension: 0 };
+  rsiHistory = [];
+  document.getElementById('status').textContent = 'Line out… waiting for bloom and bite';
+  bloom(x, y, 80, 2);
+}
+
+function updateRSI() {
+  if (!bobber || !bobber.hooked || !reeling) return;
+  // sample "pull" as random + sin based on fish size
+  const pull = Math.sin(Date.now()/200) * bobber.hooked.size * 0.3 + (Math.random()-0.5)*4;
+  rsiHistory.push(pull);
+  if (rsiHistory.length > 30) rsiHistory.shift();
+  currentRSI = calcRSI(rsiHistory);
+  document.getElementById('fill').style.width = currentRSI + '%';
+  document.getElementById('rsiVal').textContent = currentRSI.toFixed(1);
+  // tension grows if RSI extreme
+  bobber.tension += (currentRSI > 70 || currentRSI < 30) ? 0.8 : -0.3;
+  bobber.tension = Math.max(0, Math.min(100, bobber.tension));
+  if (bobber.tension > 95) {
+    // line snaps
+    document.getElementById('status').textContent = 'Line snapped — RSI imbalance';
+    bloom(bobber.x, bobber.y, 30);
+    bobber = null; line = null; reeling = false;
+  }
+}
+
+function reelSuccess() {
+  score++;
+  document.getElementById('score').textContent = 'Caught: ' + score;
+  document.getElementById('status').textContent = 'Landed! Resonance aligned.';
+  bloom(bobber.x, bobber.y, 100, 2.5);
+  bobber = null; line = null; reeling = false;
+}
+
+function loop() {
+  // sky / water gradient
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#0d2a4a');
+  g.addColorStop(0.4, '#1a4a7a');
+  g.addColorStop(0.45, '#0a3a6a');
+  g.addColorStop(1, '#051a33');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  // animated water surface bloom
+  ctx.strokeStyle = 'rgba(0,229,255,0.4)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let x = 0; x <= W; x += 4) {
+    const y = H*0.45 + Math.sin(x*0.01 + Date.now()/800)*8 + Math.sin(x*0.03 + Date.now()/500)*4;
+    if (x===0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // fish
+  if (fish.length < 12) fish.push(new Fish());
+  fish.forEach(f => { f.update(); f.draw(); });
+
+  // line & bobber
+  if (line) {
+    line.progress = Math.min(1, line.progress + 0.03);
+    const lx = line.x1 + (line.x2-line.x1)*line.progress;
+    const ly = line.y1 + (line.y2-line.y1)*line.progress;
+    ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(line.x1, line.y1);
+    ctx.lineTo(lx, ly);
+    ctx.stroke();
+    if (line.progress >= 1 && bobber) {
+      bobber.x = line.x2; bobber.y = line.y2;
+      ctx.fillStyle = '#ff3366';
+      ctx.shadowBlur = 12;
+      ctx.shadowColor = '#ff3366';
+      ctx.beginPath();
+      ctx.arc(bobber.x, bobber.y, 6, 0, Math.PI*2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      if (bobber.hooked && reeling) {
+        // pull fish toward surface
+        bobber.hooked.y -= 1.2;
+        bobber.y -= 0.8;
+        if (bobber.y < H*0.42) reelSuccess();
+      }
+    }
+  }
+
+  // particles
+  for (let i = particles.length-1; i >= 0; i--) {
+    particles[i].update();
+    particles[i].draw();
+    if (particles[i].life <= 0) particles.splice(i, 1);
+  }
+
+  updateRSI();
+
+  // tension warning
+  if (bobber && bobber.tension > 70) {
+    ctx.fillStyle = `rgba(255,50,80,${(bobber.tension-70)/40})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  requestAnimationFrame(loop);
+}
+
+canvas.addEventListener('click', e => {
+  const rect = canvas.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const y = Math.max(H*0.48, e.clientY - rect.top);
+  if (!line) cast(x, y);
+});
+
+addEventListener('keydown', e => { if (e.code === 'Space') reeling = true; });
+addEventListener('keyup', e => { if (e.code === 'Space') reeling = false; });
+
+// ambient blooms
+setInterval(() => {
+  if (Math.random() < 0.3) bloom(Math.random()*W, H*0.45 + Math.random()*20, 8, 0.4);
+}, 800);
+
+loop();
+</script>
+</body>
+</html>
